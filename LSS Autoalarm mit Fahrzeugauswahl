@@ -1,0 +1,579 @@
+// ==UserScript==
+// @name         LSS Autoshare by DieRaubsau
+// @namespace    https://www.leitstellenspiel.de/
+// @version      0.6.0
+// @author       DieRaubsau
+// @description  Öffnet Einsätze ab einer Mindest-Creditzahl, alarmiert das nächste freie Fahrzeug des gewählten Typs (Status 1/2), sendet optional eine Rückmeldung (ohne Chat-Link) und gibt den Einsatz im Verband frei.
+// @match        https://www.leitstellenspiel.de/*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // Nur im Hauptfenster laufen, nicht in den (versteckten) iframes
+  if (window.top !== window.self) return;
+
+  // ---------------------------------------------------------------
+  // Feste Vorgaben (nicht im Panel änderbar)
+  // ---------------------------------------------------------------
+  const PAUSE_S = 1;                   // Pause zwischen zwei Einsätzen: 1 Sekunde
+  const RETRY_AFTER_MS = 5 * 60 * 1000; // fehlgeschlagene Einsätze frühestens nach 5 Minuten erneut
+  const DEBUG = true;                  // Details in der Browser-Konsole (F12)
+
+  // ---------------------------------------------------------------
+  // Einstellungen (werden im Panel geändert und gespeichert)
+  // ---------------------------------------------------------------
+  const KEY = 'lssAutoAlarm_';
+  const DEFAULTS = {
+    enabled: false,        // aus Sicherheitsgründen standardmäßig aus
+    minCredits: 5000,      // Einsätze ab dieser Creditzahl werden bearbeitet
+    vehicleChoice: '',     // 'id:<Typ-ID>' = gewählter Fahrzeugtyp ('' = noch keiner gewählt)
+    intervalMin: 10,       // Prüfintervall in Minuten (frei einstellbar)
+    replyText: '',         // Nachricht für das Rückmeldesystem (leer = keine)
+    clearPreselect: false, // true: Vorauswahl des Spiels abwählen, damit nur das gewählte Fahrzeug fährt
+    onlyUnalarmed: true,   // true: nur rote Einsätze, false: auch gelbe
+    panelHidden: false,    // Panel ausgeblendet (dann erscheint der kleine Kreis)
+    panelPos: null,        // {x, y} Position des Panels
+    bubblePos: null,       // {x, y} Position des Kreises
+  };
+
+  const cfg = {};
+  for (const [k, v] of Object.entries(DEFAULTS)) cfg[k] = GM_getValue(KEY + k, v);
+  const save = (k, v) => { cfg[k] = v; GM_setValue(KEY + k, v); };
+
+  // ---------------------------------------------------------------
+  // Hilfsfunktionen
+  // ---------------------------------------------------------------
+  let ui = {};
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function log(...a) {
+    if (DEBUG) console.log('[LSS Auto-Alarm]', ...a);
+    if (ui.log) {
+      const line = document.createElement('div');
+      line.textContent = new Date().toLocaleTimeString('de-DE') + ' ' + a.filter((x) => typeof x === 'string').join(' ');
+      ui.log.prepend(line);
+      while (ui.log.children.length > 30) ui.log.lastChild.remove();
+    }
+  }
+
+  function setStatus(text) {
+    if (ui.status) ui.status.textContent = text;
+  }
+
+  async function fetchJson(url) {
+    const res = await fetch(url, { credentials: 'same-origin', headers: { Accept: 'application/json' } });
+    if (!res.ok) throw new Error(url + ' -> HTTP ' + res.status);
+    return res.json();
+  }
+
+  async function waitFor(fn, timeout = 10000, step = 200) {
+    const end = Date.now() + timeout;
+    while (Date.now() < end) {
+      try {
+        const r = fn();
+        if (r) return r;
+      } catch (e) { /* weiter warten */ }
+      await sleep(step);
+    }
+    return null;
+  }
+
+  // ---------------------------------------------------------------
+  // Daten: Einsatztypen (Credits) und eigene Fahrzeuge
+  // ---------------------------------------------------------------
+  let missionTypes = null; // Map: Typ-ID -> durchschnittliche Credits
+
+  async function loadMissionTypes() {
+    if (missionTypes) return missionTypes;
+    try {
+      const list = await fetchJson('/einsaetze.json');
+      missionTypes = new Map();
+      for (const m of list) missionTypes.set(String(m.id), Number(m.average_credits) || 0);
+      log('Einsatztypen geladen:', missionTypes.size);
+    } catch (e) {
+      log('einsaetze.json konnte nicht geladen werden', e);
+      missionTypes = null;
+    }
+    return missionTypes;
+  }
+
+  // Status 1 = einsatzbereit auf Wache, 2 = einsatzbereit über Funk
+  const isFree = (v) => v.fms_real === undefined || [1, 2].includes(Number(v.fms_real));
+  // Passt das Fahrzeug zum gewählten Fahrzeugtyp (Typ-ID aus der Fahrzeugliste)?
+  function matchesChoice(v) {
+    const c = String(cfg.vehicleChoice || '');
+    return c.startsWith('id:') && String(v.vehicle_type) === c.slice(3);
+  }
+
+  // IDs aller aktuell freien Fahrzeuge des gewählten Typs (Status 1 oder 2)
+  async function getFreeVehicleIds() {
+    const list = await fetchJson('/api/vehicles');
+    const ids = new Set();
+    for (const v of list) if (matchesChoice(v) && isFree(v)) ids.add(String(v.id));
+    return ids;
+  }
+
+  // Alle Fahrzeugtypen des Spiels (Typ-ID -> Name) aus der öffentlichen LSS-Manager-API
+  async function fetchAllTypes() {
+    const res = await fetch('https://api.lss-manager.de/de_DE/vehicles');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    const m = new Map();
+    Object.entries(data).forEach(([id, t]) => { if (t && t.caption) m.set(String(id), t.caption); });
+    return m;
+  }
+
+  // Auswahlliste mit JEDEM Fahrzeugtyp des Spiels füllen (eigene Typen zuerst, mit Anzahl)
+  async function fillTypeSelect() {
+    const sel = ui.type;
+    if (!sel) return;
+
+    const types = new Map(); // Typ-ID -> Name
+    const owned = new Map(); // Typ-ID -> Anzahl eigener Fahrzeuge
+    let ownedOk = false;
+    let catalogOk = false;
+
+    try {
+      const list = await fetchJson('/api/vehicles');
+      list.forEach((v) => {
+        const id = String(v.vehicle_type);
+        owned.set(id, (owned.get(id) || 0) + 1);
+        if (!types.has(id)) types.set(id, v.vehicle_type_caption || 'Typ ' + id);
+      });
+      ownedOk = true;
+    } catch (e) {
+      log('Eigene Fahrzeuge konnten nicht geladen werden', e);
+    }
+    try {
+      (await fetchAllTypes()).forEach((name, id) => types.set(id, name));
+      catalogOk = true;
+    } catch (e) {
+      log('Liste aller Fahrzeugtypen nicht ladbar - es erscheinen nur eigene Typen', e);
+    }
+
+    const mk = (value, text) => {
+      const o = document.createElement('option');
+      o.value = value;
+      o.textContent = text;
+      return o;
+    };
+    sel.innerHTML = '';
+    sel.appendChild(mk('', '- bitte wählen -'));
+    const byName = (a, b) => types.get(a).localeCompare(types.get(b), 'de', { numeric: true });
+    const addGroup = (label, ids) => {
+      if (!ids.length) return;
+      const og = document.createElement('optgroup');
+      og.label = label;
+      ids.forEach((id) => og.appendChild(mk('id:' + id, types.get(id) + ' (' + (owned.get(id) || 0) + ')')));
+      sel.appendChild(og);
+    };
+    const ids = [...types.keys()];
+    addGroup('Eigene Fahrzeugtypen', ids.filter((id) => owned.get(id)).sort(byName));
+    addGroup('Weitere Fahrzeugtypen', ids.filter((id) => !owned.get(id)).sort(byName));
+
+    // Ältere gespeicherte Werte (feste HLF-Vorgabe) umstellen
+    let c = String(cfg.vehicleChoice || '');
+    if (c && !c.startsWith('id:') && types.size) {
+      let newChoice = '';
+      if (c.startsWith('type:')) {
+        for (const [id, name] of types) if (name === c.slice(5)) { newChoice = 'id:' + id; break; }
+      }
+      save('vehicleChoice', newChoice);
+      c = newChoice;
+      log('Gespeicherte Fahrzeugwahl umgestellt - bitte Fahrzeugtyp prüfen');
+    }
+
+    sel.value = c;
+    if (sel.value !== c) {
+      sel.value = '';
+      if (catalogOk && ownedOk) save('vehicleChoice', ''); // gewählter Typ existiert nicht mehr
+    }
+    log(types.size + ' Fahrzeugtypen in der Auswahlliste');
+  }
+
+  // ---------------------------------------------------------------
+  // Einsatzliste auslesen
+  // ---------------------------------------------------------------
+  function missionId(el) {
+    return el.getAttribute('mission_id') || el.getAttribute('data-mission-id') || el.id.replace(/^mission_/, '');
+  }
+
+  function missionCredits(el) {
+    try {
+      const raw = el.getAttribute('data-sortable-by');
+      if (raw) {
+        const c = Number(JSON.parse(raw).credits);
+        if (Number.isFinite(c)) return c;
+      }
+    } catch (e) { /* ignorieren */ }
+    const typeId = el.getAttribute('mission_type_id') || el.getAttribute('data-mission-type-id');
+    if (typeId != null && missionTypes) {
+      const v = missionTypes.get(String(typeId).split('_')[0]);
+      if (v !== undefined) return v;
+    }
+    return null;
+  }
+
+  const hasClass = (el, cls) => el.classList.contains(cls) || !!el.querySelector('.' + cls);
+
+  function candidateMissions() {
+    const out = [];
+    document.querySelectorAll('#mission_list .missionSideBarEntry').forEach((el) => {
+      const red = hasClass(el, 'mission_panel_red');
+      const yellow = hasClass(el, 'mission_panel_yellow');
+      if (!(red || (!cfg.onlyUnalarmed && yellow))) return;
+      const id = missionId(el);
+      const credits = missionCredits(el);
+      if (!id || credits == null || credits < Number(cfg.minCredits)) return;
+      out.push({ id, credits });
+    });
+    return out.sort((a, b) => b.credits - a.credits); // lukrativste zuerst
+  }
+
+  // ---------------------------------------------------------------
+  // Rückmeldesystem: Nachricht setzen, Chat-Verlinkung abschalten
+  // ---------------------------------------------------------------
+  async function sendReply(doc) {
+    const text = (cfg.replyText || '').trim();
+    if (!text) return { info: '' };
+
+    const ta = doc.querySelector(
+      '#mission_reply_content, textarea[id*="reply" i], textarea[name*="reply" i], ' +
+      'textarea[id*="rueckmeld" i], textarea[name*="rueckmeld" i]'
+    );
+    if (!ta) return { info: 'übersprungen - Rückmeldefeld nicht gefunden' };
+
+    // Die Nachricht darf nicht im Chat landen: ohne auffindbare Chat-Option wird nichts gesendet.
+    const labelOf = (b) =>
+      (b.labels && [...b.labels].map((l) => l.textContent).join(' ')) ||
+      (b.closest('label') && b.closest('label').textContent) || '';
+    const chatBox = [...doc.querySelectorAll('input[type=checkbox]')].find((b) =>
+      /chat/i.test(`${b.id} ${b.name} ${labelOf(b)}`)
+    );
+    if (!chatBox) return { info: 'übersprungen - Chat-Option nicht gefunden (Sicherheitsabbruch)' };
+    if (chatBox.checked) chatBox.click();
+    if (chatBox.checked) return { info: 'übersprungen - Chat-Verlinkung ließ sich nicht abwählen' };
+
+    ta.focus();
+    ta.value = text;
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    ta.dispatchEvent(new Event('change', { bubbles: true }));
+
+    // Gehört das Feld zum Alarm-Formular, wird der Text mit der Alarmierung gesendet.
+    const form = ta.closest('form');
+    if (form && (form.querySelector('input.vehicle_checkbox') || form.querySelector('.alert_next, .alert_notify_alliance'))) {
+      return { info: 'gesetzt (wird mit der Alarmierung gesendet)' };
+    }
+
+    const scope = ta.closest('.panel, .well, .tab-pane') || ta.parentElement;
+    const btn = [...scope.querySelectorAll('button, input[type=submit], input[type=button], a.btn')].find(
+      (b) => !/alert_/.test(b.className)
+    );
+    if (!btn) return { info: 'Text gesetzt, aber kein Sende-Button gefunden' };
+    btn.click();
+    await sleep(1500);
+    return { info: 'gesendet' };
+  }
+
+  // ---------------------------------------------------------------
+  // Einsatz öffnen, Fahrzeug wählen, Rückmeldung, alarmieren + im Verband freigeben
+  // Läuft in einem versteckten iframe, damit die Original-Buttons des Spiels benutzt werden.
+  // ---------------------------------------------------------------
+  function findShareButton(doc) {
+    const direct = doc.querySelector('.alert_notify_alliance');
+    if (direct) return direct;
+    const btns = [...doc.querySelectorAll('a.btn, button, input[type=button], input[type=submit]')];
+    const byText = btns.find((b) => {
+      const t = b.textContent || b.value || '';
+      return /Verband/i.test(t) && /freigeben/i.test(t) && !/weiter/i.test(t);
+    });
+    return byText || doc.querySelector('.alert_next_alliance');
+  }
+
+  // Entfernung (km) aus der Fahrzeugzeile der Einsatzseite lesen; ohne Angabe: unendlich
+  function distanceOf(checkbox) {
+    const row = checkbox.closest('tr');
+    if (!row) return Infinity;
+    const m = /([\d.]+(?:,\d+)?)\s*km/i.exec(row.textContent || '');
+    if (!m) return Infinity;
+    let n = m[1];
+    if (n.includes(',')) n = n.replace(/\./g, '').replace(',', '.');
+    const v = parseFloat(n);
+    return Number.isFinite(v) ? v : Infinity;
+  }
+
+  async function processMission(id, freeIds) {
+    const frame = document.createElement('iframe');
+    frame.style.cssText = 'position:fixed;left:-9999px;top:0;width:1200px;height:800px;border:0;visibility:hidden;';
+    const loaded = new Promise((res) => frame.addEventListener('load', res, { once: true }));
+    frame.src = '/missions/' + id;
+    document.body.appendChild(frame);
+
+    try {
+      await Promise.race([loaded, sleep(20000)]);
+      const doc = frame.contentDocument;
+      if (!doc) return { ok: false, reason: 'Einsatzseite nicht lesbar' };
+
+      const ready = await waitFor(() => doc.querySelector('input.vehicle_checkbox') && findShareButton(doc), 15000);
+      if (!ready) return { ok: false, reason: 'Einsatzseite nicht bereit (Fahrzeugliste oder Freigabe-Button fehlt)' };
+
+      // Unter den freien Fahrzeugen des Typs das mit der kürzesten Entfernung nehmen
+      const candidates = [...doc.querySelectorAll('input.vehicle_checkbox')].filter(
+        (b) => freeIds.has(String(b.value)) && !b.disabled
+      );
+      const pick = candidates
+        .map((b, i) => ({ b, i, km: distanceOf(b) }))
+        .sort((x, y) => x.km - y.km || x.i - y.i)[0];
+      const chosen = pick && pick.b;
+      if (!chosen) return { ok: false, reason: 'Kein freies Fahrzeug dieses Typs in diesem Einsatz auswählbar' };
+
+      if (cfg.clearPreselect) {
+        doc.querySelectorAll('input.vehicle_checkbox:checked').forEach((c) => { if (c !== chosen) c.click(); });
+      }
+      if (!chosen.checked) chosen.click();
+
+      const reply = await sendReply(doc);
+      if (reply.info) log('Einsatz ' + id + ' Rückmeldung: ' + reply.info);
+
+      const btn = findShareButton(doc);
+      const nav = new Promise((res) => frame.addEventListener('load', res, { once: true }));
+      btn.click();
+      await Promise.race([nav, sleep(4000)]);
+      await sleep(500);
+      return { ok: true, used: String(chosen.value), km: pick.km === Infinity ? null : pick.km };
+    } catch (e) {
+      return { ok: false, reason: 'Fehler: ' + e.message };
+    } finally {
+      frame.remove();
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // Hauptschleife
+  // ---------------------------------------------------------------
+  const attempted = new Map(); // Einsatz-ID -> { t, ok }
+  let busy = false;
+  let alarmedTotal = 0;
+
+  async function tick() {
+    if (!cfg.enabled || busy) return;
+    busy = true;
+    try {
+      if (!String(cfg.vehicleChoice || '').startsWith('id:')) {
+        setStatus('Bitte zuerst einen Fahrzeugtyp auswählen');
+        return;
+      }
+      await loadMissionTypes();
+      const freeIds = await getFreeVehicleIds();
+      if (!freeIds.size) {
+        setStatus('Kein freies Fahrzeug dieses Typs verfügbar');
+        return;
+      }
+
+      const now = Date.now();
+      const list = candidateMissions().filter((m) => {
+        const a = attempted.get(m.id);
+        if (!a) return true;
+        return !a.ok && now - a.t > RETRY_AFTER_MS;
+      });
+
+      if (!list.length) {
+        setStatus('Aktiv - keine passenden Einsätze (' + alarmedTotal + ' alarmiert)');
+        return;
+      }
+
+      for (const m of list) {
+        if (!cfg.enabled || !freeIds.size) break;
+        setStatus('Bearbeite Einsatz ' + m.id + ' (' + m.credits + ' Cr) ...');
+        log('Einsatz ' + m.id + ': öffne (' + m.credits + ' Credits)');
+        const result = await processMission(m.id, freeIds);
+        attempted.set(m.id, { t: Date.now(), ok: result.ok });
+
+        if (result.ok) {
+          alarmedTotal++;
+          freeIds.delete(result.used);
+          log('Einsatz ' + m.id + ': alarmiert und im Verband freigegeben', result);
+        } else {
+          log('Einsatz ' + m.id + ': ' + result.reason, result);
+        }
+        await sleep(PAUSE_S * 1000);
+      }
+      setStatus('Aktiv - ' + alarmedTotal + ' alarmiert');
+    } catch (e) {
+      log('Fehler im Durchlauf: ' + e.message, e);
+      setStatus('Fehler: ' + e.message);
+    } finally {
+      busy = false;
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // Panel und Aktivierungskreis (beide verschiebbar)
+  // ---------------------------------------------------------------
+  function place(el, x, y) {
+    const w = el.offsetWidth;
+    const h = el.offsetHeight;
+    const cx = Math.min(Math.max(0, x), Math.max(0, window.innerWidth - w));
+    const cy = Math.min(Math.max(0, y), Math.max(0, window.innerHeight - h));
+    el.style.left = cx + 'px';
+    el.style.top = cy + 'px';
+    el.style.right = 'auto';
+    el.style.bottom = 'auto';
+  }
+
+  // Macht `el` über `handle` verschiebbar (Maus und Touch). Ein Klick ohne Bewegung ruft onTap auf.
+  function makeDraggable(el, handle, posKey, onTap) {
+    let dragging = false;
+    let moved = false;
+    let sx = 0, sy = 0, ox = 0, oy = 0;
+    handle.style.touchAction = 'none';
+
+    handle.addEventListener('pointerdown', (e) => {
+      if (e.button !== undefined && e.button !== 0) return;
+      if (e.target.closest && e.target.closest('button, input, textarea, select, label')) return;
+      dragging = true;
+      moved = false;
+      sx = e.clientX;
+      sy = e.clientY;
+      const r = el.getBoundingClientRect();
+      ox = r.left;
+      oy = r.top;
+      try { handle.setPointerCapture(e.pointerId); } catch (err) { /* ignorieren */ }
+    });
+    handle.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      const dx = e.clientX - sx;
+      const dy = e.clientY - sy;
+      if (!moved && Math.hypot(dx, dy) < 4) return;
+      moved = true;
+      place(el, ox + dx, oy + dy);
+    });
+    const end = (e) => {
+      if (!dragging) return;
+      dragging = false;
+      try { handle.releasePointerCapture(e.pointerId); } catch (err) { /* ignorieren */ }
+      if (moved) {
+        const r = el.getBoundingClientRect();
+        save(posKey, { x: Math.round(r.left), y: Math.round(r.top) });
+      } else if (onTap) {
+        onTap();
+      }
+    };
+    handle.addEventListener('pointerup', end);
+    handle.addEventListener('pointercancel', end);
+  }
+
+  let timer = null;
+  function restartTimer() {
+    if (timer) clearInterval(timer);
+    timer = setInterval(tick, Math.max(1, Number(cfg.intervalMin) || 10) * 60 * 1000);
+  }
+
+  function buildUi() {
+    const panel = document.createElement('div');
+    panel.id = 'lss-auto-alarm';
+    panel.style.cssText =
+      'position:fixed;left:8px;top:8px;z-index:99999;background:#222;color:#fff;' +
+      'font:12px/1.4 sans-serif;padding:8px 10px;border-radius:6px;width:235px;' +
+      'box-shadow:0 2px 8px rgba(0,0,0,.5)';
+    panel.innerHTML = `
+      <div id="laa-head" style="display:flex;justify-content:space-between;align-items:center;cursor:move;font-weight:bold;user-select:none">
+        <span>LSS Autoshare by DieRaubsau</span>
+        <button id="laa-hide" type="button" title="Ausblenden" style="color:#000;line-height:1.2;padding:0 8px;cursor:pointer">–</button>
+      </div>
+      <div id="laa-body" style="margin-top:6px">
+        <label><input type="checkbox" id="laa-enabled"> Aktiv</label><br>
+        <label>Min. Credits<br><input type="number" id="laa-credits" min="0" step="100" style="width:100%;color:#000"></label><br>
+        <label>Fahrzeugtyp (nächstes freies, Status 1/2)<br><select id="laa-type" style="width:100%;color:#000"></select></label><br>
+        <label>Prüfintervall (min)<br><input type="number" id="laa-interval" min="1" step="1" style="width:100%;color:#000"></label><br>
+        <label>Rückmeldung (leer = keine, kein Chat-Link)<br><textarea id="laa-reply" rows="2" style="width:100%;color:#000"></textarea></label><br>
+        <label><input type="checkbox" id="laa-clear"> Vorauswahl des Spiels abwählen</label><br>
+        <label><input type="checkbox" id="laa-unalarmed"> nur rote Einsätze</label><br>
+        <button id="laa-now" type="button" style="color:#000;margin-top:4px">Jetzt prüfen</button>
+        <div id="laa-status" style="margin-top:6px;color:#9ad"></div>
+        <div id="laa-log" style="margin-top:4px;max-height:100px;overflow:auto;color:#bbb;font-size:11px"></div>
+      </div>`;
+    document.body.appendChild(panel);
+
+    const bubble = document.createElement('div');
+    bubble.id = 'lss-auto-alarm-bubble';
+    bubble.title = 'LSS Autoshare einblenden (verschiebbar)';
+    bubble.textContent = '🚒';
+    bubble.style.cssText =
+      'position:fixed;left:8px;top:8px;z-index:99999;width:38px;height:38px;box-sizing:border-box;' +
+      'border-radius:50%;background:#222;color:#fff;font:18px/34px sans-serif;text-align:center;' +
+      'cursor:pointer;border:2px solid #888;box-shadow:0 2px 8px rgba(0,0,0,.5);user-select:none;display:none';
+    document.body.appendChild(bubble);
+
+    const $ = (sel) => panel.querySelector(sel);
+    ui = { status: $('#laa-status'), log: $('#laa-log'), type: $('#laa-type') };
+
+    const updateBubble = () => { bubble.style.borderColor = cfg.enabled ? '#3c3' : '#888'; };
+
+    function applyVisibility(hidden, persist) {
+      if (persist) save('panelHidden', hidden);
+      if (hidden) {
+        const r = panel.getBoundingClientRect();
+        bubble.style.display = 'block';
+        const p = cfg.bubblePos || { x: r.left, y: r.top };
+        place(bubble, p.x, p.y);
+        panel.style.display = 'none';
+      } else {
+        panel.style.display = '';
+        const p = cfg.panelPos || { x: 8, y: window.innerHeight - panel.offsetHeight - 8 };
+        place(panel, p.x, p.y);
+        bubble.style.display = 'none';
+      }
+    }
+
+    $('#laa-enabled').checked = cfg.enabled;
+    $('#laa-credits').value = cfg.minCredits;
+    $('#laa-reply').value = cfg.replyText;
+    $('#laa-interval').value = cfg.intervalMin;
+    $('#laa-clear').checked = cfg.clearPreselect;
+    $('#laa-unalarmed').checked = cfg.onlyUnalarmed;
+    setStatus(cfg.enabled ? 'Aktiv' : 'Aus');
+    updateBubble();
+
+    makeDraggable(panel, $('#laa-head'), 'panelPos');
+    makeDraggable(bubble, bubble, 'bubblePos', () => applyVisibility(false, true));
+    $('#laa-hide').addEventListener('click', () => applyVisibility(true, true));
+
+    $('#laa-enabled').addEventListener('change', (e) => {
+      save('enabled', e.target.checked);
+      setStatus(e.target.checked ? 'Aktiv' : 'Aus');
+      updateBubble();
+      if (e.target.checked) tick();
+    });
+    $('#laa-credits').addEventListener('change', (e) => save('minCredits', Number(e.target.value) || 0));
+    $('#laa-reply').addEventListener('change', (e) => save('replyText', e.target.value));
+    $('#laa-type').addEventListener('change', (e) => save('vehicleChoice', e.target.value));
+    $('#laa-interval').addEventListener('change', (e) => {
+      save('intervalMin', Math.max(1, Number(e.target.value) || 10));
+      e.target.value = cfg.intervalMin;
+      restartTimer();
+    });
+    $('#laa-clear').addEventListener('change', (e) => save('clearPreselect', e.target.checked));
+    $('#laa-unalarmed').addEventListener('change', (e) => save('onlyUnalarmed', e.target.checked));
+    $('#laa-now').addEventListener('click', tick);
+
+    window.addEventListener('resize', () => {
+      if (panel.style.display !== 'none') place(panel, panel.offsetLeft, panel.offsetTop);
+      if (bubble.style.display !== 'none') place(bubble, bubble.offsetLeft, bubble.offsetTop);
+    });
+
+    // Startzustand: erst Panel platzieren, dann ggf. in den Kreis umschalten
+    const start = cfg.panelPos || { x: 8, y: window.innerHeight - panel.offsetHeight - 8 };
+    place(panel, start.x, start.y);
+    applyVisibility(cfg.panelHidden, false);
+  }
+
+  buildUi();
+  fillTypeSelect();
+  restartTimer();
+  if (cfg.enabled) setTimeout(tick, 3000);
+})();
